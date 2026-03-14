@@ -2,8 +2,10 @@ use getopts::Options;
 use serde::Deserialize;
 use std::env;
 use std::fs;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, Sender};
 use std::thread;
+
+use crate::network::Event;
 
 mod network;
 
@@ -13,7 +15,7 @@ mod windows;
 #[cfg(target_os = "linux")]
 mod linux;
 
-const USBIP_DEFAULT_PORT: u16 = 3240;
+const DEFAULT_USBIP_PORT: u16 = 3240;
 
 const DEFAULT_CONFIG: &'static str = r#"
 # Uncomment if usbip (client) or usbipd (server) aren't in PATH
@@ -65,6 +67,27 @@ fn print_usage(program: &str, opts: Options) {
     print!("{}", opts.usage(&brief));
 }
 
+fn spawn_keyhandler(sender: Sender<Event>) {
+    #[cfg(target_os = "linux")]
+    thread::spawn(|| {
+        linux::KeyHandler::new(&[evdev::KeyCode::KEY_LEFTCTRL, evdev::KeyCode::KEY_RIGHTCTRL])
+            .expect("failed to create hook")
+            .run(sender)
+            .expect("hook failed");
+    });
+
+    #[cfg(target_os = "windows")]
+    thread::spawn(|| {
+        if !windows::KeyHandler::install() {
+            panic!("failed to create hook");
+        }
+
+        windows::KeyHandler::run(sender);
+    });
+
+    println!("created hook");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
@@ -102,26 +125,7 @@ fn main() {
                 network::Server::bind(server_config.addresses, server_config.port)
                     .expect("failed to create server");
 
-            #[cfg(target_os = "linux")]
-            thread::spawn(|| {
-                linux::KeyHandler::new(&[
-                    evdev::KeyCode::KEY_LEFTCTRL,
-                    evdev::KeyCode::KEY_RIGHTCTRL,
-                ])
-                .expect("failed to create hook")
-                .run(sender);
-            });
-
-            #[cfg(target_os = "windows")]
-            thread::spawn(|| {
-                if !windows::KeyHandler::install() {
-                    panic!("failed to create hook");
-                }
-
-                windows::KeyHandler::run(sender);
-            });
-
-            println!("bound to: {:?}", server.addresses());
+            spawn_keyhandler(sender);
 
             server
                 .run(
@@ -132,28 +136,15 @@ fn main() {
         } else if !is_server && let Some(client_config) = config.client {
             println!("running client...");
 
-            let mut client = network::Client::connect(&client_config.address, client_config.port)
-                .expect("failed to connect");
+            let mut client = network::Client::connect(
+                &client_config.address,
+                client_config.port,
+                client_config.usbip_port.unwrap_or(DEFAULT_USBIP_PORT),
+            )
+            .expect("failed to connect");
             let (sender, receiver) = mpsc::channel::<network::Event>();
 
-            #[cfg(target_os = "linux")]
-            thread::spawn(|| {
-                linux::KeyHandler::new(&[
-                    evdev::KeyCode::KEY_LEFTCTRL,
-                    evdev::KeyCode::KEY_RIGHTCTRL,
-                ])
-                .expect("failed to create hook")
-                .run(sender);
-            });
-
-            #[cfg(target_os = "windows")]
-            thread::spawn(|| {
-                if !windows::KeyHandler::install() {
-                    panic!("failed to create hook");
-                }
-
-                windows::KeyHandler::run(sender);
-            });
+            spawn_keyhandler(sender);
 
             client
                 .run(receiver, &config.usbip_binary.unwrap_or("usbip".into()))

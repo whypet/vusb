@@ -6,7 +6,7 @@ use nix::libc;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use std::fs;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::sync::mpsc::Sender;
 use thiserror::Error;
 
@@ -31,8 +31,10 @@ pub struct KeyHandler {
 
 impl KeyHandler {
     pub fn new(keycodes: &[KeyCode]) -> Result<KeyHandler, KeyHandlerError> {
-        let mut inotify = Inotify::init()?;
-        inotify.add_watch("/dev/input", WatchMask::CREATE | WatchMask::ATTRIB)?;
+        let inotify = Inotify::init()?;
+        inotify
+            .watches()
+            .add("/dev/input", WatchMask::CREATE | WatchMask::ATTRIB)?;
 
         let devices = Self::scan()?;
 
@@ -96,9 +98,6 @@ impl KeyHandler {
 
                 (inotify_ready, devices_ready)
             };
-
-            let mut devicefds: Vec<(&Device, BorrowedFd<'_>)> =
-                self.devices.iter().map(|d| (d, d.as_fd())).collect();
 
             if inotify_ready {
                 let mut inotify_buf = [0; 1024];

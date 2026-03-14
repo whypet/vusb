@@ -20,12 +20,13 @@ pub enum NetError {
     #[error("Serialization error")]
     PacketWrite(#[from] wincode::WriteError),
     #[error("UTF-8 error")]
-    Utf8Error(#[from] string::FromUtf8Error),
+    Utf8(#[from] string::FromUtf8Error),
+    #[error("Stream end of file")]
+    Eof,
 }
 
 pub enum Event {
     Activated,
-    Eof(SocketAddr),
 }
 
 #[derive(Debug, SchemaWrite, SchemaRead)]
@@ -36,7 +37,6 @@ pub enum Packet {
 }
 
 pub struct Server {
-    addresses: Vec<SocketAddr>,
     receiver: mpsc::Receiver<Event>,
     listener: TcpListener,
     clients: Vec<Client>,
@@ -46,6 +46,7 @@ pub struct Server {
 pub struct Client {
     pub address: SocketAddr,
     pub stream: TcpStream,
+    usbip_port: u16,
 }
 
 fn read_packet(stream: &mut TcpStream) -> Result<Option<Packet>, NetError> {
@@ -61,14 +62,22 @@ fn read_packet(stream: &mut TcpStream) -> Result<Option<Packet>, NetError> {
                     stream.read_exact(&mut buf)?;
 
                     let packet: Packet = wincode::deserialize(&buf[2..])?;
-                    println!("read packet -> {:?}: {:?}", stream.peer_addr(), packet);
+
+                    println!(
+                        "read packet -> {}: {:?}",
+                        stream.peer_addr().unwrap(),
+                        packet
+                    );
+
                     return Ok(Some(packet));
                 }
+                Ok(0) => return Err(NetError::Eof),
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(NetError::Io(e)),
             }
         }
+        Ok(0) => return Err(NetError::Eof),
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
         Err(e) => return Err(NetError::Io(e)),
@@ -84,7 +93,11 @@ fn write_packet(stream: &mut TcpStream, packet: &Packet) -> Result<(), NetError>
     stream.write_all(&len.to_le_bytes())?;
     stream.write_all(&encoded)?;
 
-    println!("wrote packet -> {:?}: {:?}", stream.peer_addr(), packet);
+    println!(
+        "wrote packet -> {}: {:?}",
+        stream.peer_addr().unwrap(),
+        packet
+    );
 
     Ok(())
 }
@@ -101,9 +114,10 @@ impl Server {
 
         listener.set_nonblocking(true)?;
 
+        println!("bound to: {:?}", addresses);
+
         Ok((
             Server {
-                addresses,
                 receiver: channel.1,
                 listener,
                 clients: Vec::new(),
@@ -113,18 +127,20 @@ impl Server {
         ))
     }
 
-    pub fn addresses(&self) -> &[SocketAddr] {
-        &self.addresses
-    }
-
     pub fn run(&mut self, usbipd_binary: &str, busids: &[String]) -> Result<(), NetError> {
+        #[cfg(target_os = "linux")]
+        {
+            // unused
+            _ = usbipd_binary;
+        }
+
         #[cfg(target_os = "windows")]
         for busid in busids {
             Command::new(usbipd_binary).args(["bind", busid]).output()?;
         }
 
         loop {
-            let mut cycle_host: bool = false;
+            let mut cycle_host = false;
 
             match self.listener.accept() {
                 Ok((s, addr)) => {
@@ -132,6 +148,7 @@ impl Server {
                     self.clients.push(Client {
                         address: addr,
                         stream: s,
+                        usbip_port: 0,
                     });
                     println!("stream opened: {}", addr);
                 }
@@ -140,12 +157,32 @@ impl Server {
             }
 
             if self.host_index > 0 {
-                let client = &mut self.clients[self.host_index - 1];
+                let mut eof = false;
+                let index = self.host_index - 1;
+                let client = &mut self.clients[index];
 
-                while let Ok(Some(packet)) = read_packet(&mut client.stream) {
-                    match packet {
-                        Packet::Activated => cycle_host = true,
-                        _ => {}
+                loop {
+                    let res = read_packet(&mut client.stream);
+
+                    if let Ok(Some(packet)) = res {
+                        match packet {
+                            Packet::Activated => cycle_host = true,
+                            _ => {}
+                        }
+                    } else {
+                        match res {
+                            Err(NetError::Eof) => eof = true,
+                            _ => {}
+                        }
+                        break;
+                    }
+                }
+
+                if eof {
+                    self.eof(index - 1);
+                    if self.host_index >= index + 1 {
+                        self.host_index = 0;
+                        cycle_host = true;
                     }
                 }
             }
@@ -153,51 +190,67 @@ impl Server {
             while let Ok(event) = self.receiver.try_recv() {
                 match event {
                     Event::Activated => {
-                        if self.host_index == 0 {
-                            cycle_host = true;
-                        }
-                    }
-                    Event::Eof(addr) => {
-                        if let Some(index) = self.clients.iter().position(|c| c.address == addr) {
-                            self.clients.remove(index);
-                            if self.host_index >= index + 1 {
-                                cycle_host = true;
-                            }
-                            println!("stream closed: {}", addr);
-                        }
+                        cycle_host = true;
                     }
                 }
             }
 
-            if cycle_host {
+            if cycle_host && !self.clients.is_empty() {
                 println!("swapping hosts now...");
 
-                let new_index = (self.host_index + 1) % (self.clients.len() + 1);
-                let attach_packet = Packet::Attach {
-                    busids: busids.into(),
-                };
-                let detach_packet = Packet::Detach;
+                if self.host_index > 0 {
+                    let mut eof = false;
+
+                    if let Some(old_client) = self.clients.get_mut(self.host_index - 1) {
+                        if write_packet(&mut old_client.stream, &Packet::Detach).is_err() {
+                            eof = true;
+                        }
+                    }
+
+                    if eof {
+                        self.eof(self.host_index - 1);
+                        self.host_index -= 1;
+                    }
+                }
+
+                self.host_index = (self.host_index + 1) % (self.clients.len() + 1);
 
                 if self.host_index > 0 {
-                    let client_a = &mut self.clients[self.host_index - 1];
-                    write_packet(&mut client_a.stream, &detach_packet)?;
-                }
+                    let mut eof = false;
 
-                if new_index > 0 {
-                    let client = &mut self.clients[new_index - 1];
-                    write_packet(&mut client.stream, &attach_packet)?;
-                }
+                    if let Some(new_client) = self.clients.get_mut(self.host_index - 1) {
+                        if write_packet(
+                            &mut new_client.stream,
+                            &Packet::Attach {
+                                busids: busids.to_owned(),
+                            },
+                        )
+                        .is_err()
+                        {
+                            eof = true;
+                        }
+                    }
 
-                self.host_index = new_index;
+                    if eof {
+                        self.eof(self.host_index - 1);
+                        self.host_index = 0;
+                    }
+                }
             }
 
             thread::sleep(time::Duration::from_millis(10));
         }
     }
+
+    fn eof(&mut self, index: usize) {
+        let address = self.clients[index].address;
+        self.clients.remove(index);
+        println!("stream closed: {}", address);
+    }
 }
 
 impl Client {
-    pub fn connect(addr: &str, port: u16) -> Result<Client, NetError> {
+    pub fn connect(addr: &str, port: u16, usbip_port: u16) -> Result<Client, NetError> {
         let sockaddr = SocketAddr::new(addr.parse()?, port);
         let stream = TcpStream::connect(sockaddr)?;
         stream.set_nonblocking(true)?;
@@ -207,13 +260,22 @@ impl Client {
         Ok(Client {
             address: sockaddr,
             stream,
+            usbip_port,
         })
     }
 
     pub fn attach(&self, usbip_binary: &str, busids: &[String]) -> Result<(), NetError> {
         for busid in busids {
             Command::new(usbip_binary)
-                .args(["attach", "-r", &self.address.ip().to_string(), "-b", &busid])
+                .args([
+                    "--tcp-port",
+                    &self.usbip_port.to_string(),
+                    "attach",
+                    "-r",
+                    &self.address.ip().to_string(),
+                    "-b",
+                    &busid,
+                ])
                 .output()?;
         }
         Ok(())
@@ -243,6 +305,12 @@ impl Client {
     }
 
     pub fn run(&mut self, receiver: Receiver<Event>, usbip_binary: &str) -> Result<(), NetError> {
+        let res = self.run_loop(receiver, usbip_binary);
+        Self::detach(usbip_binary).ok();
+        res
+    }
+
+    fn run_loop(&mut self, receiver: Receiver<Event>, usbip_binary: &str) -> Result<(), NetError> {
         loop {
             while let Ok(Some(packet)) = read_packet(&mut self.stream) {
                 match packet {
@@ -257,10 +325,6 @@ impl Client {
                     Event::Activated => {
                         println!("swapping hosts now...");
                         self.activate()?;
-                    }
-                    Event::Eof(_) => {
-                        Self::detach(usbip_binary)?;
-                        break;
                     }
                 }
             }
