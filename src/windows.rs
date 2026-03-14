@@ -9,22 +9,22 @@ use crate::network::Event;
 
 static mut MAIN_THREAD_ID: u32 = 0;
 
-static KEY_HANDLER: LazyLock<Mutex<KeyHandler>> = LazyLock::new(|| {
-    Mutex::new(KeyHandler::new(vec![
+static KEY_HANDLER: LazyLock<Mutex<Hook>> = LazyLock::new(|| {
+    Mutex::new(Hook::new(vec![
         winuser::VK_LCONTROL as u32,
         winuser::VK_RCONTROL as u32,
     ]))
 });
 
-pub struct KeyHandler {
+pub struct Hook {
     keycodes: Vec<u32>,
     down: Vec<u32>,
     active: bool,
 }
 
-impl KeyHandler {
-    pub fn new(keycodes: Vec<u32>) -> KeyHandler {
-        KeyHandler {
+impl Hook {
+    pub fn new(keycodes: Vec<u32>) -> Self {
+        Self {
             keycodes,
             down: Vec::new(),
             active: false,
@@ -60,7 +60,7 @@ impl KeyHandler {
     }
 
     pub fn run(sender: Sender<Event>) {
-        while let Some(msg) = KeyHandler::pump() {
+        while let Some(msg) = Self::pump() {
             if msg == winuser::WM_NOTIFY {
                 if let Ok(mut key_handler) = KEY_HANDLER.lock()
                     && key_handler.is_active()

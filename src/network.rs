@@ -64,7 +64,7 @@ fn read_packet(stream: &mut TcpStream) -> Result<Option<Packet>, NetError> {
                     let packet: Packet = wincode::deserialize(&buf[2..])?;
 
                     println!(
-                        "read packet -> {}: {:?}",
+                        "<< read packet from {}: {:?}",
                         stream.peer_addr().unwrap(),
                         packet
                     );
@@ -94,7 +94,7 @@ fn write_packet(stream: &mut TcpStream, packet: &Packet) -> Result<(), NetError>
     stream.write_all(&encoded)?;
 
     println!(
-        "wrote packet -> {}: {:?}",
+        ">> wrote packet to {}: {:?}",
         stream.peer_addr().unwrap(),
         packet
     );
@@ -142,49 +142,10 @@ impl Server {
         loop {
             let mut cycle_host = false;
 
-            match self.listener.accept() {
-                Ok((s, addr)) => {
-                    s.set_nonblocking(true)?;
-                    self.clients.push(Client {
-                        address: addr,
-                        stream: s,
-                        usbip_port: 0,
-                    });
-                    println!("stream opened: {}", addr);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(NetError::Io(e)),
-            }
+            self.accept()?;
 
             if self.host_index > 0 {
-                let mut eof = false;
-                let index = self.host_index - 1;
-                let client = &mut self.clients[index];
-
-                loop {
-                    let res = read_packet(&mut client.stream);
-
-                    if let Ok(Some(packet)) = res {
-                        match packet {
-                            Packet::Activated => cycle_host = true,
-                            _ => {}
-                        }
-                    } else {
-                        match res {
-                            Err(NetError::Eof) => eof = true,
-                            _ => {}
-                        }
-                        break;
-                    }
-                }
-
-                if eof {
-                    self.eof(index - 1);
-                    if self.host_index >= index + 1 {
-                        self.host_index = 0;
-                        cycle_host = true;
-                    }
-                }
+                cycle_host = self.handle_host();
             }
 
             while let Ok(event) = self.receiver.try_recv() {
@@ -196,49 +157,93 @@ impl Server {
             }
 
             if cycle_host && !self.clients.is_empty() {
-                println!("swapping hosts now...");
+                println!("cycling hosts now...");
 
-                if self.host_index > 0 {
-                    let mut eof = false;
-
-                    if let Some(old_client) = self.clients.get_mut(self.host_index - 1) {
-                        if write_packet(&mut old_client.stream, &Packet::Detach).is_err() {
-                            eof = true;
-                        }
-                    }
-
-                    if eof {
-                        self.eof(self.host_index - 1);
-                        self.host_index -= 1;
-                    }
-                }
-
-                self.host_index = (self.host_index + 1) % (self.clients.len() + 1);
-
-                if self.host_index > 0 {
-                    let mut eof = false;
-
-                    if let Some(new_client) = self.clients.get_mut(self.host_index - 1) {
-                        if write_packet(
-                            &mut new_client.stream,
-                            &Packet::Attach {
-                                busids: busids.to_owned(),
-                            },
-                        )
-                        .is_err()
-                        {
-                            eof = true;
-                        }
-                    }
-
-                    if eof {
-                        self.eof(self.host_index - 1);
-                        self.host_index = 0;
-                    }
-                }
+                self.cycle_host(busids);
             }
 
             thread::sleep(time::Duration::from_millis(10));
+        }
+    }
+
+    fn accept(&mut self) -> Result<(), NetError> {
+        match self.listener.accept() {
+            Ok((s, addr)) => {
+                s.set_nonblocking(true)?;
+                self.clients.push(Client {
+                    address: addr,
+                    stream: s,
+                    usbip_port: 0,
+                });
+                println!("stream opened: {}", addr);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(NetError::Io(e)),
+        }
+    }
+
+    fn handle_host(&mut self) -> bool {
+        let mut cycle_host = false;
+
+        let mut eof = false;
+        let index = self.host_index - 1;
+        let client = &mut self.clients[index];
+
+        loop {
+            let res = read_packet(&mut client.stream);
+
+            if let Ok(Some(packet)) = res {
+                match packet {
+                    Packet::Activated => cycle_host = true,
+                    _ => {}
+                }
+            } else {
+                match res {
+                    Err(NetError::Eof) => eof = true,
+                    _ => {}
+                }
+                break;
+            }
+        }
+
+        if eof {
+            self.eof(index - 1);
+            if self.host_index >= index + 1 {
+                self.host_index = 0;
+                cycle_host = true;
+            }
+        }
+
+        cycle_host
+    }
+
+    fn cycle_host(&mut self, busids: &[String]) {
+        if self.host_index > 0 {
+            self.write(&Packet::Detach);
+        }
+
+        self.host_index = (self.host_index + 1) % (self.clients.len() + 1);
+
+        if self.host_index > 0 {
+            self.write(&Packet::Attach {
+                busids: busids.to_owned(),
+            });
+        }
+    }
+
+    fn write(&mut self, packet: &Packet) {
+        let mut eof = false;
+
+        if let Some(client) = self.clients.get_mut(self.host_index - 1) {
+            if write_packet(&mut client.stream, packet).is_err() {
+                eof = true;
+            }
+        }
+
+        if eof {
+            self.eof(self.host_index - 1);
+            self.host_index -= 1;
         }
     }
 

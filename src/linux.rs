@@ -13,14 +13,14 @@ use thiserror::Error;
 use crate::network::Event;
 
 #[derive(Error, Debug)]
-pub enum KeyHandlerError {
+pub enum HookError {
     #[error("IO error")]
     Io(#[from] io::Error),
     #[error("Poll error")]
     Poll(#[from] Errno),
 }
 
-pub struct KeyHandler {
+pub struct Hook {
     keycodes: Vec<KeyCode>,
     down: Vec<KeyCode>,
     inotify: Inotify,
@@ -29,8 +29,8 @@ pub struct KeyHandler {
     active: bool,
 }
 
-impl KeyHandler {
-    pub fn new(keycodes: &[KeyCode]) -> Result<KeyHandler, KeyHandlerError> {
+impl Hook {
+    pub fn new(keycodes: &[KeyCode]) -> Result<Hook, HookError> {
         let inotify = Inotify::init()?;
         inotify
             .watches()
@@ -38,7 +38,7 @@ impl KeyHandler {
 
         let devices = Self::scan()?;
 
-        Ok(KeyHandler {
+        Ok(Hook {
             keycodes: keycodes.into(),
             down: Vec::new(),
             inotify,
@@ -48,7 +48,7 @@ impl KeyHandler {
         })
     }
 
-    fn scan() -> Result<Vec<Device>, KeyHandlerError> {
+    fn scan() -> Result<Vec<Device>, HookError> {
         let paths = fs::read_dir("/dev/input")?.filter_map(|entry| {
             let path = entry.ok()?.path();
             if path.file_name()?.to_str()?.starts_with("event") {
@@ -74,7 +74,7 @@ impl KeyHandler {
         Ok(devices)
     }
 
-    pub fn run(&mut self, sender: Sender<Event>) -> Result<(), KeyHandlerError> {
+    pub fn run(&mut self, sender: Sender<Event>) -> Result<(), HookError> {
         loop {
             if self.scan {
                 self.scan = false;

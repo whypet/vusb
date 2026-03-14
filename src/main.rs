@@ -70,7 +70,7 @@ fn print_usage(program: &str, opts: Options) {
 fn spawn_keyhandler(sender: Sender<Event>) {
     #[cfg(target_os = "linux")]
     thread::spawn(|| {
-        linux::KeyHandler::new(&[evdev::KeyCode::KEY_LEFTCTRL, evdev::KeyCode::KEY_RIGHTCTRL])
+        linux::Hook::new(&[evdev::KeyCode::KEY_LEFTCTRL, evdev::KeyCode::KEY_RIGHTCTRL])
             .expect("failed to create hook")
             .run(sender)
             .expect("hook failed");
@@ -78,11 +78,11 @@ fn spawn_keyhandler(sender: Sender<Event>) {
 
     #[cfg(target_os = "windows")]
     thread::spawn(|| {
-        if !windows::KeyHandler::install() {
+        if !windows::Hook::install() {
             panic!("failed to create hook");
         }
 
-        windows::KeyHandler::run(sender);
+        windows::Hook::run(sender);
     });
 
     println!("created hook");
