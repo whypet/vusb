@@ -1,3 +1,4 @@
+use std::default::Default;
 use std::io::prelude::*;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::Command;
@@ -40,7 +41,7 @@ pub struct Server {
     receiver: mpsc::Receiver<Event>,
     listener: TcpListener,
     clients: Vec<Client>,
-    host_index: usize,
+    host_cycler: HostCycler,
 }
 
 pub struct Client {
@@ -49,57 +50,9 @@ pub struct Client {
     usbip_port: u16,
 }
 
-fn read_packet(stream: &mut TcpStream) -> Result<Option<Packet>, NetError> {
-    let mut lenbuf = [0u8; 2];
-
-    match stream.peek(&mut lenbuf) {
-        Ok(2) => {
-            let len = u16::from_le_bytes(lenbuf) as usize + 2;
-            let mut buf = vec![0u8; len];
-
-            match stream.peek(&mut buf) {
-                Ok(n) if n == len => {
-                    stream.read_exact(&mut buf)?;
-
-                    let packet: Packet = wincode::deserialize(&buf[2..])?;
-
-                    println!(
-                        "<< read packet from {}: {:?}",
-                        stream.peer_addr().unwrap(),
-                        packet
-                    );
-
-                    return Ok(Some(packet));
-                }
-                Ok(0) => return Err(NetError::Eof),
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(NetError::Io(e)),
-            }
-        }
-        Ok(0) => return Err(NetError::Eof),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-        Err(e) => return Err(NetError::Io(e)),
-    }
-
-    Ok(None)
-}
-
-fn write_packet(stream: &mut TcpStream, packet: &Packet) -> Result<(), NetError> {
-    let encoded: Vec<u8> = wincode::serialize(packet)?;
-    let len = encoded.len() as u16;
-
-    stream.write_all(&len.to_le_bytes())?;
-    stream.write_all(&encoded)?;
-
-    println!(
-        ">> wrote packet to {}: {:?}",
-        stream.peer_addr().unwrap(),
-        packet
-    );
-
-    Ok(())
+#[derive(Default)]
+struct HostCycler {
+    pub host: usize,
 }
 
 impl Server {
@@ -121,7 +74,7 @@ impl Server {
                 receiver: channel.1,
                 listener,
                 clients: Vec::new(),
-                host_index: 0,
+                host_cycler: Default::default(),
             },
             channel.0,
         ))
@@ -144,8 +97,8 @@ impl Server {
 
             self.accept()?;
 
-            if self.host_index > 0 {
-                cycle_host = self.handle_host();
+            if self.host_cycler.host > 0 {
+                cycle_host = self.read(self.host_cycler.host - 1);
             }
 
             while let Ok(event) = self.receiver.try_recv() {
@@ -159,7 +112,22 @@ impl Server {
             if cycle_host && !self.clients.is_empty() {
                 println!("cycling hosts now...");
 
-                self.cycle_host(busids);
+                if self.host_cycler.host > 0 {
+                    self.write(self.host_cycler.host - 1, &Packet::Detach);
+                }
+
+                self.host_cycler.cycle(self.clients.len());
+
+                if self.host_cycler.host > 0
+                    && !self.write(
+                        self.host_cycler.host - 1,
+                        &Packet::Attach {
+                            busids: busids.to_owned(),
+                        },
+                    )
+                {
+                    println!("failed to attach!");
+                }
             }
 
             thread::sleep(time::Duration::from_millis(10));
@@ -183,73 +151,62 @@ impl Server {
         }
     }
 
-    fn handle_host(&mut self) -> bool {
+    fn read(&mut self, client_index: usize) -> bool {
         let mut cycle_host = false;
 
         let mut eof = false;
-        let index = self.host_index - 1;
-        let client = &mut self.clients[index];
+        let client = &mut self.clients[client_index];
 
         loop {
-            let res = read_packet(&mut client.stream);
-
-            if let Ok(Some(packet)) = res {
-                match packet {
-                    Packet::Activated => cycle_host = true,
-                    _ => {}
+            match read_packet(&mut client.stream) {
+                Ok(Some(packet)) => {
+                    match packet {
+                        Packet::Activated => cycle_host = true,
+                        _ => {}
+                    }
+                    continue;
                 }
-            } else {
-                match res {
-                    Err(NetError::Eof) => eof = true,
-                    _ => {}
+                Err(_) => {
+                    eof = true;
                 }
-                break;
+                _ => {}
             }
+            break;
         }
 
         if eof {
-            self.eof(index - 1);
-            if self.host_index >= index + 1 {
-                self.host_index = 0;
-                cycle_host = true;
-            }
+            self.eof(client_index + 1);
         }
 
         cycle_host
     }
 
-    fn cycle_host(&mut self, busids: &[String]) {
-        if self.host_index > 0 {
-            self.write(&Packet::Detach);
-        }
-
-        self.host_index = (self.host_index + 1) % (self.clients.len() + 1);
-
-        if self.host_index > 0 {
-            self.write(&Packet::Attach {
-                busids: busids.to_owned(),
-            });
-        }
-    }
-
-    fn write(&mut self, packet: &Packet) {
+    fn write(&mut self, client_index: usize, packet: &Packet) -> bool {
         let mut eof = false;
 
-        if let Some(client) = self.clients.get_mut(self.host_index - 1) {
+        if let Some(client) = self.clients.get_mut(client_index) {
             if write_packet(&mut client.stream, packet).is_err() {
                 eof = true;
             }
         }
 
         if eof {
-            self.eof(self.host_index - 1);
-            self.host_index -= 1;
+            self.eof(client_index + 1);
         }
+
+        !eof
     }
 
     fn eof(&mut self, index: usize) {
-        let address = self.clients[index].address;
-        self.clients.remove(index);
+        let (address, stream) = (
+            self.clients[index - 1].address,
+            &mut self.clients[index - 1].stream,
+        );
+
+        stream.shutdown(net::Shutdown::Both).ok();
+        self.clients.remove(index - 1);
+        self.host_cycler.eof(index);
+
         println!("stream closed: {}", address);
     }
 }
@@ -328,7 +285,6 @@ impl Client {
             while let Ok(event) = receiver.try_recv() {
                 match event {
                     Event::Activated => {
-                        println!("swapping hosts now...");
                         self.activate()?;
                     }
                 }
@@ -342,4 +298,71 @@ impl Client {
         let packet = Packet::Activated;
         write_packet(&mut self.stream, &packet)
     }
+}
+
+impl HostCycler {
+    pub fn cycle(&mut self, client_count: usize) {
+        self.host = (self.host + 1) % (client_count + 1);
+    }
+
+    pub fn eof(&mut self, host: usize) {
+        if self.host > host {
+            self.host -= 1;
+        } else if self.host == host {
+            self.host = 0;
+        }
+    }
+}
+
+fn read_packet(stream: &mut TcpStream) -> Result<Option<Packet>, NetError> {
+    let mut lenbuf = [0u8; 2];
+
+    match stream.peek(&mut lenbuf) {
+        Ok(2) => {
+            let len = u16::from_le_bytes(lenbuf) as usize + 2;
+            let mut buf = vec![0u8; len];
+
+            match stream.peek(&mut buf) {
+                Ok(n) if n == len => {
+                    stream.read_exact(&mut buf)?;
+
+                    let packet: Packet = wincode::deserialize(&buf[2..])?;
+
+                    println!(
+                        "<< read packet from {}: {:?}",
+                        stream.peer_addr().unwrap(),
+                        packet
+                    );
+
+                    return Ok(Some(packet));
+                }
+                Ok(0) => return Err(NetError::Eof),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(NetError::Io(e)),
+            }
+        }
+        Ok(0) => return Err(NetError::Eof),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+        Err(e) => return Err(NetError::Io(e)),
+    }
+
+    Ok(None)
+}
+
+fn write_packet(stream: &mut TcpStream, packet: &Packet) -> Result<(), NetError> {
+    let encoded: Vec<u8> = wincode::serialize(packet)?;
+    let len = encoded.len() as u16;
+
+    stream.write_all(&len.to_le_bytes())?;
+    stream.write_all(&encoded)?;
+
+    println!(
+        ">> wrote packet to {}: {:?}",
+        stream.peer_addr().unwrap(),
+        packet
+    );
+
+    Ok(())
 }
